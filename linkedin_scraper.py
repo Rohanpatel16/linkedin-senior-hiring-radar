@@ -6,20 +6,19 @@ import urllib.parse
 import re
 import requests
 from datetime import datetime
-from apify_client import ApifyClient
 
-# 1. Environment Secrets & Token Parsing
+# 1. Environment Secrets & Smart Token Parsing (Handles space, newline, or comma)
 APIFY_TOKENS_RAW = os.getenv("APIFY_TOKENS", "").strip()
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 
-# Parse multiline or comma-separated tokens
-tokens = [t.strip() for t in APIFY_TOKENS_RAW.replace(",", "\n").split("\n") if t.strip()]
+# Regex split handles spaces, newlines, and commas seamlessly
+tokens = [t.strip() for t in re.split(r'[\s,]+', APIFY_TOKENS_RAW) if t.strip()]
 
 if not tokens:
     print("❌ No Apify tokens provided! Exiting.")
     exit(1)
 
-print(f"🔑 Loaded {len(tokens)} Apify API Token(s).")
+print(f"🔑 Successfully loaded {len(tokens)} Apify API Token(s).")
 
 # 2. Build the 12 Exact Search Combinations
 EXPERIENCE_LEVELS = ["associate", "mid-senior", "director", "executive"]
@@ -33,14 +32,14 @@ for wp in WORKPLACE_TYPES:
             "workplaceType": [wp],
             "experienceLevel": [exp],
             "locations": ["India"],
-            "maxItems": 800,  # Max items per search
+            "maxItems": 800,
             "postedLimit": "24h",
             "sortBy": "relevance",
             "easyApply": False,
             "under10Applicants": False
         })
 
-TOTAL_SEARCHES = len(SEARCH_MATRIX)  # Exactly 12
+TOTAL_SEARCHES = len(SEARCH_MATRIX)
 print(f"📋 Generated {TOTAL_SEARCHES} distinct search combinations.")
 
 # 3. Helper Functions for Data Cleaning & Classification
@@ -61,12 +60,10 @@ def classify_client_type(company_data, job_desc):
 
 def extract_industry(company_data, job_data):
     industries = []
-    # From company industries
     for ind in (company_data.get("industries") or []):
         name = ind.get("name") if isinstance(ind, dict) else str(ind)
         if name and name not in industries:
             industries.append(name)
-    # From root job industries
     for ind in (job_data.get("industries") or []):
         if ind and ind not in industries:
             industries.append(ind)
@@ -95,28 +92,41 @@ def extract_location(job_data):
         return f"{city}, {country}"
     return loc.get("linkedinText") or "India"
 
-# 4. Execute 12 Searches Across Provided Tokens
+# 4. Execute 12 Searches Directly via Apify REST API (No library bugs)
 all_raw_jobs = []
+ACTOR_ID = "zn01OAlzP853oqn4Z"
 
 for idx, search_input in enumerate(SEARCH_MATRIX):
-    # Round-robin or split searches across available tokens
     token_index = idx % len(tokens)
     current_token = tokens[token_index]
-    client = ApifyClient(current_token)
 
     wp_label = search_input["workplaceType"][0].upper()
     exp_label = search_input["experienceLevel"][0].upper()
     print(f"\n🚀 Running Search #{idx+1}/{TOTAL_SEARCHES} [{wp_label} | {exp_label}] on Token #{token_index+1}...")
 
+    run_url = f"https://api.apify.com/v2/acts/{ACTOR_ID}/runs?token={current_token}&waitForFinish=300"
+    headers = {"Content-Type": "application/json"}
+
     try:
-        run = client.actor("zn01OAlzP853oqn4Z").call(run_input=search_input, timeout_secs=300)
-        dataset_id = run.get("defaultDatasetId")
-        
-        items = list(client.dataset(dataset_id).iterate_items())
-        print(f"✅ Search #{idx+1} completed: Fetched {len(items)} jobs.")
-        all_raw_jobs.extend(items)
+        res = requests.post(run_url, headers=headers, json=search_input, timeout=360)
+        if res.status_code in [200, 201]:
+            run_data = res.json().get("data", {})
+            dataset_id = run_data.get("defaultDatasetId")
+            
+            # Fetch dataset items
+            dataset_url = f"https://api.apify.com/v2/datasets/{dataset_id}/items?token={current_token}&clean=true&format=json"
+            items_res = requests.get(dataset_url, timeout=60)
+            
+            if items_res.status_code == 200:
+                items = items_res.json()
+                print(f"✅ Search #{idx+1} completed: Fetched {len(items)} jobs.")
+                all_raw_jobs.extend(items)
+            else:
+                print(f"⚠️ Failed to fetch dataset #{dataset_id}: {items_res.status_code}")
+        else:
+            print(f"⚠️ Apify Run Error on Search #{idx+1}: {res.status_code}, {res.text}")
     except Exception as e:
-        print(f"⚠️ Error on Search #{idx+1}: {e}")
+        print(f"⚠️ Network Error on Search #{idx+1}: {e}")
 
 print(f"\n📦 Total raw jobs fetched across all 12 runs: {len(all_raw_jobs)}")
 
@@ -134,15 +144,12 @@ for item in all_raw_jobs:
     company_name = company.get("name") or "Unknown Company"
     title = item.get("title") or "Unknown Role"
     
-    # Extract Hiring Team (Direct Poster DM Link)
     hiring_team = item.get("hiringTeam") or []
     poster_name = hiring_team[0].get("name", "Not Disclosed") if hiring_team else "Not Disclosed"
     poster_url = hiring_team[0].get("linkedinUrl", "") if hiring_team else ""
 
-    # Generate Executive Search Dork
     dork_headhunting = f'https://www.google.com/search?q=site:linkedin.com/in+"{urllib.parse.quote(company_name)}"+("Founder"+OR+"CEO"+OR+"CTO"+OR+"Chief+People+Officer"+OR+"Head+of+Talent")'
 
-    # Format Date
     posted_date = item.get("postedDate") or ""
     if posted_date:
         try:
@@ -199,7 +206,6 @@ if not DISCORD_WEBHOOK_URL:
     print("⚠️ No DISCORD_WEBHOOK_URL configured. Skipping upload.")
     exit(0)
 
-# Calculate summary stats for the Discord message
 total_direct = sum(1 for x in enriched_leads if x["Client Classification"] == "Direct Employer")
 total_agency = len(enriched_leads) - total_direct
 total_with_poster = sum(1 for x in enriched_leads if x["Job Poster LinkedIn Profile"])
