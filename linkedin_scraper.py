@@ -6,19 +6,19 @@ import urllib.parse
 import re
 import requests
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# 1. Environment Secrets & Smart Token Parsing (Handles space, newline, or comma)
+# 1. Environment Secrets & Smart Token Parsing
 APIFY_TOKENS_RAW = os.getenv("APIFY_TOKENS", "").strip()
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 
-# Regex split handles spaces, newlines, and commas seamlessly
 tokens = [t.strip() for t in re.split(r'[\s,]+', APIFY_TOKENS_RAW) if t.strip()]
 
 if not tokens:
     print("❌ No Apify tokens provided! Exiting.")
     exit(1)
 
-print(f"🔑 Successfully loaded {len(tokens)} Apify API Token(s).")
+print(f"🔑 Loaded {len(tokens)} Apify Token(s).")
 
 # 2. Build the 12 Exact Search Combinations
 EXPERIENCE_LEVELS = ["associate", "mid-senior", "director", "executive"]
@@ -40,9 +40,9 @@ for wp in WORKPLACE_TYPES:
         })
 
 TOTAL_SEARCHES = len(SEARCH_MATRIX)
-print(f"📋 Generated {TOTAL_SEARCHES} distinct search combinations.")
+print(f"📋 Firing {TOTAL_SEARCHES} searches simultaneously in parallel...")
 
-# 3. Helper Functions for Data Cleaning & Classification
+# 3. Helper Functions
 AGENCY_KEYWORDS = [
     "staffing", "recruitment", "consulting", "hr solutions", "manpower", "talent acquisition", 
     "managed team", "offshore team", "rpo", "executive search", "workforce solutions", "headhunting"
@@ -52,7 +52,6 @@ def classify_client_type(company_data, job_desc):
     specialities = " ".join(company_data.get("specialities") or []).lower()
     industries = " ".join([i.get("name", "") if isinstance(i, dict) else str(i) for i in (company_data.get("industries") or [])]).lower()
     desc = (company_data.get("description") or "").lower()
-    
     combined = f"{specialities} {industries} {desc}"
     if any(k in combined for k in AGENCY_KEYWORDS):
         return "Staffing Agency / Marketplace"
@@ -74,7 +73,6 @@ def extract_employee_size(company_data):
     range_info = company_data.get("employeeCountRange") or {}
     start = range_info.get("start")
     end = range_info.get("end")
-    
     if count and start and end:
         return f"{count:,} ({start}-{end} range)"
     elif count:
@@ -92,21 +90,17 @@ def extract_location(job_data):
         return f"{city}, {country}"
     return loc.get("linkedinText") or "India"
 
-# 4. Execute 12 Searches Directly via Apify REST API (No library bugs)
-all_raw_jobs = []
+# 4. Single Search Worker Function (For Parallel Threads)
 ACTOR_ID = "zn01OAlzP853oqn4Z"
 
-for idx, search_input in enumerate(SEARCH_MATRIX):
-    token_index = idx % len(tokens)
-    current_token = tokens[token_index]
-
+def execute_search_job(idx, search_input, token, token_idx):
     wp_label = search_input["workplaceType"][0].upper()
     exp_label = search_input["experienceLevel"][0].upper()
-    print(f"\n🚀 Running Search #{idx+1}/{TOTAL_SEARCHES} [{wp_label} | {exp_label}] on Token #{token_index+1}...")
+    print(f"🚀 [Thread {idx+1}] Starting: [{wp_label} | {exp_label}] on Token #{token_idx+1}")
 
-    run_url = f"https://api.apify.com/v2/acts/{ACTOR_ID}/runs?token={current_token}&waitForFinish=300"
+    run_url = f"https://api.apify.com/v2/acts/{ACTOR_ID}/runs?token={token}&waitForFinish=300"
     headers = {"Content-Type": "application/json"}
-
+    
     try:
         res = requests.post(run_url, headers=headers, json=search_input, timeout=360)
         if res.status_code in [200, 201]:
@@ -114,23 +108,41 @@ for idx, search_input in enumerate(SEARCH_MATRIX):
             dataset_id = run_data.get("defaultDatasetId")
             
             # Fetch dataset items
-            dataset_url = f"https://api.apify.com/v2/datasets/{dataset_id}/items?token={current_token}&clean=true&format=json"
+            dataset_url = f"https://api.apify.com/v2/datasets/{dataset_id}/items?token={token}&clean=true&format=json"
             items_res = requests.get(dataset_url, timeout=60)
-            
             if items_res.status_code == 200:
                 items = items_res.json()
-                print(f"✅ Search #{idx+1} completed: Fetched {len(items)} jobs.")
-                all_raw_jobs.extend(items)
+                print(f"✅ [Thread {idx+1}] Finished! Retrieved {len(items)} jobs.")
+                return items
             else:
-                print(f"⚠️ Failed to fetch dataset #{dataset_id}: {items_res.status_code}")
+                print(f"⚠️ [Thread {idx+1}] Failed to fetch dataset: {items_res.status_code}")
         else:
-            print(f"⚠️ Apify Run Error on Search #{idx+1}: {res.status_code}, {res.text}")
+            print(f"⚠️ [Thread {idx+1}] Apify Error: {res.status_code}, {res.text}")
     except Exception as e:
-        print(f"⚠️ Network Error on Search #{idx+1}: {e}")
+        print(f"⚠️ [Thread {idx+1}] Network Error: {e}")
+    return []
 
-print(f"\n📦 Total raw jobs fetched across all 12 runs: {len(all_raw_jobs)}")
+# 5. Execute All Searches Concurrently (Parallel Execution)
+all_raw_jobs = []
+max_parallel_workers = min(12, max(4, len(tokens) * 3))
 
-# 5. Deduplicate and Enrich into Structured Records
+print(f"⚡ Launching ThreadPoolExecutor with {max_parallel_workers} concurrent threads...")
+
+with ThreadPoolExecutor(max_workers=max_parallel_workers) as executor:
+    futures = []
+    for idx, search_input in enumerate(SEARCH_MATRIX):
+        token_index = idx % len(tokens)
+        token = tokens[token_index]
+        futures.append(executor.submit(execute_search_job, idx, search_input, token, token_index))
+
+    for future in as_completed(futures):
+        result = future.result()
+        if result:
+            all_raw_jobs.extend(result)
+
+print(f"\n📦 Finished Parallel Runs! Total raw items: {len(all_raw_jobs)}")
+
+# 6. Deduplicate and Enrich into Structured Records
 seen_job_ids = set()
 enriched_leads = []
 
@@ -182,7 +194,7 @@ for item in all_raw_jobs:
 
 print(f"🎯 Total Unique Verified Leads: {len(enriched_leads)}")
 
-# 6. Write CSV File
+# 7. Write CSV File
 today_str = datetime.now().strftime("%d-%b-%Y").upper()
 csv_filename = f"LinkedIn_India_Hiring_Leads_{today_str}.csv"
 
@@ -199,11 +211,11 @@ with open(csv_filename, mode="w", newline="", encoding="utf-8-sig") as f:
     writer.writeheader()
     writer.writerows(enriched_leads)
 
-print(f"💾 Successfully saved CSV: {csv_filename}")
+print(f"💾 Saved CSV file: {csv_filename}")
 
-# 7. Upload CSV Directly to Discord via Webhook
+# 8. Upload CSV to Discord
 if not DISCORD_WEBHOOK_URL:
-    print("⚠️ No DISCORD_WEBHOOK_URL configured. Skipping upload.")
+    print("⚠️ No DISCORD_WEBHOOK_URL configured. Done.")
     exit(0)
 
 total_direct = sum(1 for x in enriched_leads if x["Client Classification"] == "Direct Employer")
@@ -215,7 +227,7 @@ summary_text = (
     f"• 🎯 **Total Unique Jobs Scraped:** {len(enriched_leads):,}\n"
     f"• 🏢 **Direct Employers:** {total_direct:,} | 🏛️ **Agency/Marketplace Mandates:** {total_agency:,}\n"
     f"• 👤 **Direct Poster DMs Available:** {total_with_poster:,} contacts\n"
-    f"• ⚡ **Search Matrix:** 12 Combinations across Remote, Hybrid & On-site\n\n"
+    f"• ⚡ **Search Matrix:** 12 Parallel Combinations across Remote, Hybrid & On-site\n\n"
     f"📎 *The complete spreadsheet with Industry, Employee Size, and Headhunting links is attached below:*"
 )
 
