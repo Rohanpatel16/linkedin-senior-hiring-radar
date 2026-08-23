@@ -1,0 +1,54 @@
+name: LinkedIn 12-Search Lead Generator
+
+on:
+  workflow_dispatch:
+    inputs:
+      apify_tokens:
+        description: 'Paste your Apify API Token(s) [One token per line]:'
+        required: true
+        type: string
+        default: ''
+
+  schedule:
+    # 8:30 AM IST (3:00 AM UTC) - Drops the morning reminder with 1-tap launch link
+    - cron: '0 3 * * *'
+
+jobs:
+  # Step A: Morning Reminder Notification (Runs on Schedule)
+  send-reminder:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send Discord 1-Tap Launch Reminder
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          REPO_URL="https://github.com/${{ github.repository }}/actions/workflows/linkedin_radar.yml"
+          MESSAGE="⏰ **GOOD MORNING! LINKEDIN LEAD RADAR IS READY**\n\nTap the button below on your phone to paste today's Apify tokens and launch the 12 searches:\n\n🚀 **[👉 TAP HERE TO PASTE APIS & START RUN]($REPO_URL)**"
+          curl -H "Content-Type: application/json" -X POST -d "{\"content\": \"$MESSAGE\", \"username\": \"LinkedIn Lead Generator\"}" "$DISCORD_WEBHOOK_URL"
+
+  # Step B: Main 12-Search Scraper (Runs when you paste tokens & tap Run)
+  run-scraper:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install Dependencies
+        run: |
+          pip install -r requirements.txt
+
+      - name: Execute 12-Search LinkedIn Generator & Upload CSV
+        env:
+          APIFY_TOKENS: ${{ github.event.inputs.apify_tokens }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+        run: |
+          python linkedin_scraper.py
