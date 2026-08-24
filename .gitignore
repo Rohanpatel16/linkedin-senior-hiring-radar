@@ -1,0 +1,18 @@
+# Generated CSV reports & outputs
+*.csv
+LinkedIn_*.csv
+
+# Python environment & cache
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+ENV/
+env/
+.env
+
+# IDE / OS files
+.DS_Store
+.vscode/
+.idea/

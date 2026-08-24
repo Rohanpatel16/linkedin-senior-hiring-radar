@@ -43,18 +43,67 @@ TOTAL_SEARCHES = len(SEARCH_MATRIX)
 print(f"📋 Firing {TOTAL_SEARCHES} searches simultaneously in parallel...")
 
 # 3. Helper Functions
-AGENCY_KEYWORDS = [
-    "staffing", "recruitment", "consulting", "hr solutions", "manpower", "talent acquisition", 
-    "managed team", "offshore team", "rpo", "executive search", "workforce solutions", "headhunting"
+EXPLICIT_AGENCY_INDUSTRIES = [
+    "staffing and recruiting", "human resources services", 
+    "employment agencies", "executive search", "rpo", "placement agency"
 ]
 
+EXPLICIT_AGENCY_KEYWORDS = [
+    "staffing agency", "recruitment agency", "recruiting agency", 
+    "executive search firm", "headhunting firm", "manpower agency", 
+    "temp staffing", "contingent staffing", "rpo provider", "placement agency",
+    "hiring solutions"
+]
+
+EXPLICIT_AGENCY_NAME_PATTERNS = [
+    r"\bstaffing\b", r"\brecruitment\b", r"\brecruiting\b", r"\bheadhunters?\b",
+    r"\bmanpower agency\b", r"\bplacement agency\b", r"\bhr solutions\b", r"\bexecutive search\b",
+    r"\bjobtrade\b", r"\bnaukripay\b", r"\bzigsaw\b"
+]
+
+def clean_company_name(name):
+    """Strip common legal suffixes for cleaner search queries."""
+    if not name or name == "Unknown Company":
+        return ""
+    cleaned = re.sub(r'(?i)\b(pvt|ltd|private|limited|llp|inc|corp|corporation|gmbh|co)\b|\.', '', name)
+    return cleaned.strip()
+
+def extract_domain(website):
+    """Extract clean root domain from website URL."""
+    if not website:
+        return ""
+    try:
+        url = website if website.startswith("http") else "http://" + website
+        parsed = urllib.parse.urlparse(url)
+        netloc = parsed.netloc or parsed.path
+        netloc = netloc.replace("www.", "").split("/")[0]
+        return netloc
+    except:
+        return ""
+
 def classify_client_type(company_data, job_desc):
+    comp_name = (company_data.get("name") or "").lower()
+    
+    industries_list = [i.get("name", "") if isinstance(i, dict) else str(i) for i in (company_data.get("industries") or [])]
+    industries_str = " ".join(industries_list).lower()
+    
     specialities = " ".join(company_data.get("specialities") or []).lower()
-    industries = " ".join([i.get("name", "") if isinstance(i, dict) else str(i) for i in (company_data.get("industries") or [])]).lower()
-    desc = (company_data.get("description") or "").lower()
-    combined = f"{specialities} {industries} {desc}"
-    if any(k in combined for k in AGENCY_KEYWORDS):
+    comp_desc = (company_data.get("description") or "").lower()
+    
+    # 1. Check if Company Name clearly indicates a recruiting/staffing agency
+    for pattern in EXPLICIT_AGENCY_NAME_PATTERNS:
+        if re.search(pattern, comp_name):
+            return "Staffing Agency / Marketplace"
+            
+    # 2. Check if Industry explicitly includes staffing / recruiting / HR services
+    if any(ag_ind in industries_str for ag_ind in EXPLICIT_AGENCY_INDUSTRIES):
         return "Staffing Agency / Marketplace"
+        
+    # 3. Check if Specialities or Description explicitly define the business as a staffing agency
+    combined_spec_desc = f"{specialities} {comp_desc}"
+    if any(ag_kw in combined_spec_desc for ag_kw in EXPLICIT_AGENCY_KEYWORDS):
+        return "Staffing Agency / Marketplace"
+        
     return "Direct Employer"
 
 def extract_industry(company_data, job_data):
@@ -68,18 +117,21 @@ def extract_industry(company_data, job_data):
             industries.append(ind)
     return "; ".join(industries) if industries else "Technology / General"
 
-def extract_employee_size(company_data):
+def extract_employee_info(company_data):
     count = company_data.get("employeeCount")
     range_info = company_data.get("employeeCountRange") or {}
     start = range_info.get("start")
     end = range_info.get("end")
-    if count and start and end:
-        return f"{count:,} ({start}-{end} range)"
-    elif count:
-        return f"{count:,} employees"
-    elif start and end:
-        return f"{start}-{end} range"
-    return "Not Disclosed"
+    
+    count_num = count if count else ""
+    if start and end:
+        range_str = f"{start}-{end}"
+    elif start:
+        range_str = f"{start}+"
+    else:
+        range_str = "Not Disclosed"
+        
+    return count_num, range_str
 
 def extract_location(job_data):
     loc = job_data.get("location") or {}
@@ -89,6 +141,18 @@ def extract_location(job_data):
     if city:
         return f"{city}, {country}"
     return loc.get("linkedinText") or "India"
+
+def normalize_workplace_type(wp):
+    if not wp:
+        return "On-Site"
+    wp_str = str(wp).lower().replace("_", "-").replace(" ", "-")
+    if "remote" in wp_str:
+        return "Remote"
+    elif "hybrid" in wp_str:
+        return "Hybrid"
+    elif "site" in wp_str or "office" in wp_str:
+        return "On-Site"
+    return wp.title()
 
 # 4. Single Search Worker Function (For Parallel Threads)
 ACTOR_ID = "zn01OAlzP853oqn4Z"
@@ -142,93 +206,165 @@ with ThreadPoolExecutor(max_workers=max_parallel_workers) as executor:
 
 print(f"\n📦 Finished Parallel Runs! Total raw items: {len(all_raw_jobs)}")
 
-# 6. Deduplicate and Enrich into Structured Records
+# 6. Deduplicate & Group by Company into Structured Records
 seen_job_ids = set()
-enriched_leads = []
+unique_raw_jobs = []
 
 for item in all_raw_jobs:
     job_id = item.get("id")
     if not job_id or job_id in seen_job_ids:
         continue
     seen_job_ids.add(job_id)
+    unique_raw_jobs.append(item)
 
+# Group jobs by Company Name
+company_groups = {}
+for item in unique_raw_jobs:
     company = item.get("company") or {}
-    company_name = company.get("name") or "Unknown Company"
-    title = item.get("title") or "Unknown Role"
-    
-    hiring_team = item.get("hiringTeam") or []
-    poster_name = hiring_team[0].get("name", "Not Disclosed") if hiring_team else "Not Disclosed"
-    poster_url = hiring_team[0].get("linkedinUrl", "") if hiring_team else ""
+    comp_name = company.get("name") or "Unknown Company"
+    if comp_name not in company_groups:
+        company_groups[comp_name] = []
+    company_groups[comp_name].append(item)
 
-    dork_headhunting = f'https://www.google.com/search?q=site:linkedin.com/in+"{urllib.parse.quote(company_name)}"+("Founder"+OR+"CEO"+OR+"CTO"+OR+"Chief+People+Officer"+OR+"Head+of+Talent")'
+company_leads = []
 
-    posted_date = item.get("postedDate") or ""
-    if posted_date:
-        try:
-            dt = datetime.fromisoformat(posted_date.replace("Z", "+00:00"))
-            posted_date_str = dt.strftime("%d-%b-%Y %H:%M UTC")
-        except:
-            posted_date_str = posted_date[:16]
+for comp_name, job_items in company_groups.items():
+    cleaned_name = clean_company_name(comp_name)
+    first_item = job_items[0]
+    first_company = first_item.get("company") or {}
+
+    website = first_company.get("website") or ""
+    domain = extract_domain(website)
+    industry = extract_industry(first_company, first_item)
+    emp_count, emp_range = extract_employee_info(first_company)
+    client_class = classify_client_type(first_company, first_item.get("descriptionText", ""))
+
+    # Generate targeted Google Search Dorks for Decision-Makers
+    if cleaned_name:
+        encoded_name = urllib.parse.quote_plus(f'"{cleaned_name}"')
+        c_suite_dork = f'https://www.google.com/search?q=site:linkedin.com/in+{encoded_name}+%28%22Founder%22+OR+%22CEO%22+OR+%22CTO%22+OR+%22Managing+Director%22%29'
+        hr_lead_dork = f'https://www.google.com/search?q=site:linkedin.com/in+{encoded_name}+%28%22Head+of+Talent%22+OR+%22VP+HR%22+OR+%22Talent+Acquisition%22+OR+%22CHRO%22%29'
     else:
-        posted_date_str = "Recent"
+        c_suite_dork = ""
+        hr_lead_dork = ""
+
+    # Aggregate lists across all job postings for this company
+    titles = []
+    seniorities = set()
+    workplaces = set()
+    locations = set()
+    job_links = []
+    posters = set()
+    poster_links = set()
+    total_applicants = 0
+    posted_dates = []
+
+    for item in job_items:
+        t = item.get("title") or "Unknown Role"
+        if t and t not in titles:
+            titles.append(t)
+
+        exp = item.get("experienceLevel") or item.get("query", {}).get("experienceLevel", ["General"])[0].title()
+        if exp:
+            seniorities.add(exp)
+
+        wp = normalize_workplace_type(item.get("workplaceType"))
+        if wp:
+            workplaces.add(wp)
+
+        loc = extract_location(item)
+        if loc:
+            locations.add(loc)
+
+        j_url = item.get("linkedinUrl") or f"https://www.linkedin.com/jobs/view/{item.get('id')}/"
+        if j_url and j_url not in job_links:
+            job_links.append(j_url)
+
+        hiring_team = item.get("hiringTeam") or []
+        if hiring_team:
+            p_name = hiring_team[0].get("name")
+            p_url = hiring_team[0].get("linkedinUrl")
+            if p_name and p_name != "Not Disclosed":
+                posters.add(p_name)
+            if p_url:
+                poster_links.add(p_url)
+
+        try:
+            total_applicants += int(item.get("applicants", 0))
+        except:
+            pass
+
+        p_date = item.get("postedDate") or ""
+        if p_date:
+            try:
+                dt = datetime.fromisoformat(p_date.replace("Z", "+00:00"))
+                posted_dates.append(dt.strftime("%Y-%m-%d %H:%M UTC"))
+            except:
+                posted_dates.append(p_date[:16])
 
     record = {
-        "Company Name": company_name,
-        "Industry / Sector": extract_industry(company, item),
-        "Company Employee Size": extract_employee_size(company),
-        "Job Title": title,
-        "Seniority Level": item.get("experienceLevel") or item.get("query", {}).get("experienceLevel", ["General"])[0].title(),
-        "Workplace Type": (item.get("workplaceType") or "Office").title(),
-        "City / Location": extract_location(item),
-        "Client Classification": classify_client_type(company, item.get("descriptionText", "")),
-        "Applicant Count": item.get("applicants", 0),
-        "Job Poster Name": poster_name,
-        "Job Poster LinkedIn Profile": poster_url,
-        "Company Website": company.get("website") or "",
-        "Company LinkedIn URL": company.get("linkedinUrl") or "",
-        "Decision-Maker Headhunting URL": dork_headhunting,
-        "Job Posting Link": item.get("linkedinUrl") or f"https://www.linkedin.com/jobs/view/{job_id}/",
-        "Posted Date": posted_date_str
+        "Company Name": comp_name,
+        "Open Job Count": len(job_items),
+        "Client Classification": client_class,
+        "Industry / Sector": industry,
+        "Company Website": website,
+        "Company Domain": domain,
+        "Employee Count": emp_count,
+        "Employee Size Range": emp_range,
+        "Job Titles": " | ".join(titles),
+        "Seniority Levels": "; ".join(sorted(seniorities)),
+        "Workplace Types": "; ".join(sorted(workplaces)),
+        "Locations": "; ".join(sorted(locations)),
+        "Total Applicants": total_applicants,
+        "Job Poster Name(s)": "; ".join(sorted(posters)) if posters else "Not Disclosed",
+        "Job Poster LinkedIn Profile(s)": " | ".join(sorted(poster_links)),
+        "Company LinkedIn URL": first_company.get("linkedinUrl") or "",
+        "C-Suite Dork Search": c_suite_dork,
+        "HR / TA Lead Dork Search": hr_lead_dork,
+        "Job Posting Links": " | ".join(job_links),
+        "Latest Posted Date": posted_dates[0] if posted_dates else "Recent"
     }
-    enriched_leads.append(record)
+    company_leads.append(record)
 
-print(f"🎯 Total Unique Verified Leads: {len(enriched_leads)}")
+print(f"🎯 Total Unique Hiring Companies Discovered: {len(company_leads)} (from {len(unique_raw_jobs)} job posts)")
 
-# 7. Write CSV File
+# 7. Write Company-Grouped CSV File
 today_str = datetime.now().strftime("%d-%b-%Y").upper()
 csv_filename = f"LinkedIn_India_Hiring_Leads_{today_str}.csv"
 
 fieldnames = [
-    "Company Name", "Industry / Sector", "Company Employee Size", "Job Title", 
-    "Seniority Level", "Workplace Type", "City / Location", "Client Classification", 
-    "Applicant Count", "Job Poster Name", "Job Poster LinkedIn Profile", 
-    "Company Website", "Company LinkedIn URL", "Decision-Maker Headhunting URL", 
-    "Job Posting Link", "Posted Date"
+    "Company Name", "Open Job Count", "Client Classification", "Industry / Sector", 
+    "Company Website", "Company Domain", "Employee Count", "Employee Size Range", 
+    "Job Titles", "Seniority Levels", "Workplace Types", "Locations", "Total Applicants", 
+    "Job Poster Name(s)", "Job Poster LinkedIn Profile(s)", "Company LinkedIn URL", 
+    "C-Suite Dork Search", "HR / TA Lead Dork Search", "Job Posting Links", "Latest Posted Date"
 ]
 
 with open(csv_filename, mode="w", newline="", encoding="utf-8-sig") as f:
     writer = csv.DictWriter(f, fieldnames=fieldnames)
     writer.writeheader()
-    writer.writerows(enriched_leads)
+    writer.writerows(company_leads)
 
-print(f"💾 Saved CSV file: {csv_filename}")
+print(f"💾 Saved Company Leads CSV file: {csv_filename}")
 
-# 8. Upload CSV to Discord
+# 8. Upload CSV & Company-Centric Summary to Discord
 if not DISCORD_WEBHOOK_URL:
     print("⚠️ No DISCORD_WEBHOOK_URL configured. Done.")
     exit(0)
 
-total_direct = sum(1 for x in enriched_leads if x["Client Classification"] == "Direct Employer")
-total_agency = len(enriched_leads) - total_direct
-total_with_poster = sum(1 for x in enriched_leads if x["Job Poster LinkedIn Profile"])
+total_companies = len(company_leads)
+total_jobs = len(unique_raw_jobs)
+total_direct_companies = sum(1 for c in company_leads if c["Client Classification"] == "Direct Employer")
+total_agency_companies = total_companies - total_direct_companies
+companies_with_posters = sum(1 for c in company_leads if c["Job Poster LinkedIn Profile(s)"])
 
 summary_text = (
     f"📊 **LINKEDIN INDIA HIRING RADAR — {today_str}**\n\n"
-    f"• 🎯 **Total Unique Jobs Scraped:** {len(enriched_leads):,}\n"
-    f"• 🏢 **Direct Employers:** {total_direct:,} | 🏛️ **Agency/Marketplace Mandates:** {total_agency:,}\n"
-    f"• 👤 **Direct Poster DMs Available:** {total_with_poster:,} contacts\n"
+    f"• 🏢 **Total Hiring Companies Discovered:** {total_companies:,} ({total_jobs:,} active job openings)\n"
+    f"• 🎯 **Direct Employer Companies:** {total_direct_companies:,} | 🏛️ **Agency Mandates:** {total_agency_companies:,}\n"
+    f"• 👤 **Companies with Named Recruiter DMs:** {companies_with_posters:,}\n"
     f"• ⚡ **Search Matrix:** 12 Parallel Combinations across Remote, Hybrid & On-site\n\n"
-    f"📎 *The complete spreadsheet with Industry, Employee Size, and Headhunting links is attached below:*"
+    f"📎 *The complete company lead spreadsheet with Industry, Headcount, and Headhunting links is attached below:*"
 )
 
 payload = {
@@ -246,8 +382,8 @@ try:
         res = requests.post(DISCORD_WEBHOOK_URL, files=files, timeout=60)
         
     if res.status_code in [200, 204]:
-        print("🚀 CSV file and summary successfully uploaded to Discord!")
+        print("🚀 CSV file and company summary successfully uploaded to Discord!")
     else:
         print(f"Discord upload failed: {res.status_code}, {res.text}")
 except Exception as e:
-    print(f"Error posting file to Discord: {e}")
+        print(f"Error posting file to Discord: {e}")
